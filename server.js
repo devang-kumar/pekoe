@@ -7,6 +7,12 @@ const bodyParser = require('body-parser');
 const db = require('./db');
 require('dotenv').config();
 
+if (!db) {
+    console.error("CRITICAL: Database client not initialized. Check your .env file.");
+    // We let the process stay alive so nodemon doesn't loop-crash, 
+    // but the app won't function correctly.
+}
+
 const app = express();
 const http = require('http').createServer(app);
 const io = require('socket.io')(http, {
