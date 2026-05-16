@@ -1,3 +1,4 @@
+require('dotenv').config({ override: true });
 const express = require('express');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -5,7 +6,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const bodyParser = require('body-parser');
 const db = require('./db');
-require('dotenv').config();
+
 
 if (!db) {
     console.error("CRITICAL: Database client not initialized. Check your .env file.");
