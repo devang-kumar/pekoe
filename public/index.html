@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+    <title>PëKœ — Dark Luxury</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com"/>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet"/>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+    <div class="lcard">
+        <div class="llogo">PëKœ</div>
+        <div class="ltag">India's communal third space —<br/>where every voice finds its platform and its reward.</div>
+        <input class="lin" id="ln" type="text" placeholder="Choose your username…" maxlength="24" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()"/>
+        <input class="lin" id="le" type="email" placeholder="Email address (optional)" onkeydown="if(event.key==='Enter')doLogin()"/>
+        <button class="btn-p" onclick="doLogin()">Enter PëKœ →</button>
+        <div class="lbonus">🎁 New members get <strong>100 PëKs</strong> + Founder badge + 2× earning for 24h</div>
+    </div>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+    <nav id="sidebar">
+        <div class="slogo">PëKœ</div>
+        <div class="sstreak" id="streak-display">
+            <div class="sstreak-flame">🔥</div>
+            <div class="sstreak-info">
+                <div class="sstreak-num" id="streak-num">0</div>
+                <div class="sstreak-lbl">Day Streak</div>
+            </div>
+        </div>
+        <div class="nitem active" data-view="home" onclick="nav('home')"><span class="nicon">🏠</span>Home Feed</div>
+        <div class="nitem" data-view="hottake" onclick="nav('hottake')"><span class="nicon">🔥</span>Hot Takes</div>
+        <div class="nitem" data-view="townhall" onclick="nav('townhall')"><span class="nicon">⚔️</span>Townhall</div>
+        <div class="nitem" data-view="circles" onclick="nav('circles')"><span class="nicon">🏘️</span>Circles</div>
+        <div class="nitem" data-view="verify" onclick="nav('verify')"><span class="nicon">✅</span>Verify</div>
+        <div class="nitem" data-view="quests" onclick="nav('quests')"><span class="nicon">🎯</span>Daily Quests</div>
+        <div class="nitem" data-view="leaderboard" onclick="nav('leaderboard')"><span class="nicon">🏆</span>Leaderboard</div>
+        <div class="slabel">Your Circles</div>
+        <div id="sbcirc"></div>
+        <div class="sbottom">
+            <div class="uchip" onclick="nav('profile')">
+                <div class="uav" id="sbav">?</div>
+                <div><div class="uname" id="sbn">—</div><div class="upeks" id="sbp">— PëKs</div></div>
+            </div>
+        </div>
+    </nav>
+
+    <div id="main">
+        <div id="topbar">
+            <div class="ttitle" id="ttl">Home Feed</div>
+            <div class="tlive"><div class="pdot"></div><span id="lc">—</span> online</div>
+            <button class="bcreate" onclick="openModal()">+ Create Post</button>
+        </div>
+        <div id="content"></div>
+    </div>
+</div>
+
+<!-- POST MODAL -->
+<div id="moverlay" class="hidden" onclick="if(event.target===this)closeModal()">
+    <div class="mcard" onclick="event.stopPropagation()">
+        <div class="mhead">
+            <div class="mtitle">Create a Post</div>
+            <button class="mclose" onclick="closeModal()">✕</button>
+        </div>
+        <div class="mbody">
+            <label class="flbl">Post type</label>
+            <div class="tsel">
+                <button class="tbtn sel" onclick="selType('regular',this)">💬 Regular</button>
+                <button class="tbtn" onclick="selType('hot',this)">🔥 Hot Take</button>
+                <button class="tbtn" onclick="selType('sage',this)">🧠 Sage Q&A</button>
+                <button class="tbtn" onclick="selType('townhall',this)">⚔️ Townhall</button>
+                <button class="tbtn" onclick="selType('poll',this)">📊 Poll</button>
+            </div>
+            <label class="flbl">Circle</label>
+            <select class="ssel" id="pcirc"></select>
+            <label class="flbl">Title</label>
+            <input class="finput" id="ptitle" placeholder="What's your take?" maxlength="200"/>
+            <label class="flbl">Body <span style="color:var(--text3);font-weight:400">(optional)</span></label>
+            <textarea class="finput" id="pbody" placeholder="Add more context…" rows="3"></textarea>
+            <div id="thextra" class="hidden">
+                <label class="flbl">Side A label</label>
+                <input class="finput" id="tha" placeholder="e.g. Bengaluru"/>
+                <label class="flbl">Side B label</label>
+                <input class="finput" id="thb" placeholder="e.g. Mumbai"/>
+            </div>
+            <div id="pollextra" class="hidden">
+                <label class="flbl">Poll options (one per line, 2–4 options)</label>
+                <textarea class="finput" id="pollopts" placeholder="Option 1&#10;Option 2&#10;Option 3" rows="4"></textarea>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div style="font-size:.73rem;color:var(--teal)">✦ Earn +5 PëKs for posting</div>
+                <button class="bsm" onclick="submitPost()">Post it →</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="toasts"></div>
+<div id="xp-fountain"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Render Deployment Configuration (Blueprint)
+# This file allows you to deploy the entire PëKœ app with one click on Render.
+
+services:
+  - type: web
+    name: pekoe-app
+    env: node
+    plan: free # Change to 'starter' if you want persistent storage
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true # Generates a random secret for you
+      - key: DB_FILE
+        value: /data/pekoe.db # Path to the database on the persistent disk
+    
+    # DISK CONFIGURATION
+    # Note: Persistent disks require a paid plan (Starter, $7/mo).
+    # If using the Free plan, the database will reset on every redeploy.
+    # To enable persistence, uncomment the lines below:
+    # disk:
+    #   name: pekoe-db
+    #   mountPath: /data
+    #   sizeGB: 1
