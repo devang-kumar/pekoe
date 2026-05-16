@@ -33,70 +33,69 @@ const authenticate = (req, res, next) => {
     const token = req.headers['authorization'];
     if (!token) return res.status(401).json({ error: 'Authentication required' });
     
-    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    jwt.verify(token, JWT_SECRET, async (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Session expired. Please login again.' });
         
-        // Verify user exists in DB (especially after DB reset)
-        db.get("SELECT id FROM users WHERE id = ?", [decoded.id], (err, user) => {
-            if (err || !user) {
-                return res.status(401).json({ error: 'User not found. Please log in again.' });
-            }
-            req.userId = decoded.id;
-            req.username = decoded.username;
-            next();
-        });
+        // Verify user exists in Supabase
+        const { data: user, error } = await db.from('users').select('id').eq('id', decoded.id).single();
+        if (error || !user) {
+            return res.status(401).json({ error: 'User not found. Please log in again.' });
+        }
+        req.userId = decoded.id;
+        req.username = decoded.username;
+        next();
     });
 };
 
 // API ROUTES
 
 // Auth: Login / Register
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     const { username, email } = req.body;
     if (!username || username.length < 2) return res.status(400).json({ error: 'Valid username required' });
 
-    db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
+    const { data: user, error } = await db.from('users').select('*').eq('username', username).maybeSingle();
+    if (error) return res.status(500).json({ error: 'Database error' });
 
-        if (user) {
-            const today = new Date().toDateString();
-            let newStreak = user.streak;
-            const yesterday = new Date(Date.now() - 86400000).toDateString();
+    if (user) {
+        const today = new Date().toISOString().split('T')[0];
+        let newStreak = user.streak;
+        const yesterdayDate = new Date();
+        yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+        const yesterday = yesterdayDate.toISOString().split('T')[0];
 
-            if (user.last_login !== today) {
-                if (user.last_login === yesterday) newStreak++;
-                else newStreak = 1;
-                db.run("UPDATE users SET streak = ?, last_login = ? WHERE id = ?", [newStreak, today, user.id]);
-            }
-
-            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
-            res.json({ token, user: { ...user, streak: newStreak } });
-        } else {
-            const avatarColor = ['#E8531F', '#7C3AED', '#0D9488', '#2563EB', '#10B981', '#F5A623', '#EF4444', '#00C9B1'][Math.floor(Math.random() * 8)];
-            const today = new Date().toDateString();
-            db.run("INSERT INTO users (username, email, peks, avatar_color, streak, last_login) VALUES (?, ?, ?, ?, ?, ?)",
-                [username, email || '', 100, avatarColor, 1, today],
-                function(err) {
-                    if (err) return res.status(500).json({ error: 'Failed to create user' });
-                    const userId = this.lastID;
-                    db.run("INSERT INTO user_badges (user_id, badge_id) VALUES (?, ?)", [userId, 'founder']);
-                    db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [userId, 100, 'Welcome bonus — Founder! 🌟']);
-                    
-                    const token = jwt.sign({ id: userId, username }, JWT_SECRET, { expiresIn: '30d' });
-                    res.json({ token, user: { id: userId, username, peks: 100, avatar_color: avatarColor, streak: 1, last_login: today } });
-                }
-            );
+        if (user.last_login !== today) {
+            if (user.last_login === yesterday) newStreak++;
+            else newStreak = 1;
+            await db.from('users').update({ streak: newStreak, last_login: today }).eq('id', user.id);
         }
-    });
+
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ token, user: { ...user, streak: newStreak } });
+    } else {
+        const avatarColor = ['#E8531F', '#7C3AED', '#0D9488', '#2563EB', '#10B981', '#F5A623', '#EF4444', '#00C9B1'][Math.floor(Math.random() * 8)];
+        const today = new Date().toISOString().split('T')[0];
+        
+        const { data: newUser, error: insertError } = await db.from('users').insert([
+            { username, email: email || '', peks: 100, avatar_color: avatarColor, streak: 1, last_login: today }
+        ]).select().single();
+
+        if (insertError) return res.status(500).json({ error: 'Failed to create user' });
+        
+        await db.from('user_badges').insert([{ user_id: newUser.id, badge_id: 'founder' }]);
+        await db.from('peks_history').insert([{ user_id: newUser.id, amt: 100, reason: 'Welcome bonus — Founder! 🌟' }]);
+        
+        const token = jwt.sign({ id: newUser.id, username }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ token, user: { ...newUser } });
+    }
 });
 
 // Posts: Get all with sort and type filtering
-app.get('/api/posts', (req, res) => {
+app.get('/api/posts', async (req, res) => {
     const { sort, type } = req.query;
     const token = req.headers['authorization'];
     let userId = null;
     
-    // Optional auth to get user vote state
     if (token) {
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
@@ -104,222 +103,238 @@ app.get('/api/posts', (req, res) => {
         } catch(e) {}
     }
 
-    let orderBy = "created_at DESC";
-    if (sort === 'top') orderBy = "votes DESC";
-    else if (sort === 'hot') orderBy = "(votes - dn) DESC";
-
-    let query = "SELECT p.*, (SELECT type FROM post_votes WHERE user_id = ? AND post_id = p.id) as user_vote FROM posts p";
-    let params = [userId];
+    let query = db.from('posts').select(`
+        *,
+        post_votes!left(type)
+    `);
 
     if (type) {
-        query += " WHERE p.type = ?";
-        params.push(type);
+        query = query.eq('type', type);
     }
-    
-    query += ` ORDER BY ${orderBy} LIMIT 100`;
 
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            console.error("Fetch Error:", err.message);
-            return res.status(500).json({ error: 'Failed to fetch posts' });
+    if (sort === 'top') {
+        query = query.order('votes', { ascending: false });
+    } else if (sort === 'hot') {
+        // Simple hot sort for demo: votes - dn
+        // Note: Real "hot" logic usually involves time decay
+        query = query.order('votes', { ascending: false });
+    } else {
+        query = query.order('created_at', { ascending: false });
+    }
+
+    // Filters for user_vote separately if userId exists
+    // Supabase can do joins, but to get a specific user's vote we often need a separate filter or a complex join.
+    // For simplicity, we'll fetch posts and then map user votes if needed.
+    const { data: posts, error } = await query.limit(100);
+
+    if (error) {
+        console.error("Fetch Error:", error.message);
+        return res.status(500).json({ error: 'Failed to fetch posts' });
+    }
+
+    // If userId, fetch their votes for these posts
+    let userVotes = {};
+    if (userId && posts.length > 0) {
+        const postIds = posts.map(p => p.id);
+        const { data: votes } = await db.from('post_votes')
+            .select('post_id, type')
+            .eq('user_id', userId)
+            .in('post_id', postIds);
+        
+        if (votes) {
+            votes.forEach(v => { userVotes[v.post_id] = v.type; });
         }
-        res.json(rows.map(r => ({ ...r, poll_data: r.poll_data ? JSON.parse(r.poll_data) : null })));
-    });
+    }
+
+    res.json(posts.map(p => ({ 
+        ...p, 
+        poll_data: typeof p.poll_data === 'string' ? JSON.parse(p.poll_data) : p.poll_data,
+        user_vote: userVotes[p.id] || null
+    })));
 });
 
 // Posts: Create new
-app.post('/api/posts', authenticate, (req, res) => {
+app.post('/api/posts', authenticate, async (req, res) => {
     const { id, type, circle_id, title, body, sideA, sideB, poll_data } = req.body;
     const userId = req.userId;
     const username = req.username;
 
-    db.get("SELECT avatar_color FROM users WHERE id = ?", [userId], (err, user) => {
-        if (err || !user) {
-            return res.status(401).json({ error: 'User profile not found. Please log in again.' });
-        }
-        const avatarColor = user.avatar_color || '#E8531F';
-        db.run(`INSERT INTO posts (id, user_id, username, avatar_color, type, circle_id, title, body, sideA, sideB, poll_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [id, userId, username, avatarColor, type, circle_id, title, body || '', sideA || null, sideB || null, JSON.stringify(poll_data || null)],
-            function(err) {
-                if (err) {
-                    console.error("Insert Error:", err.message);
-                    return res.status(500).json({ error: 'Failed to publish post: ' + err.message });
-                }
-                
-                // Broadcast new post
-                const newPost = { id, user_id: userId, username, avatar_color: avatarColor, type, circle_id, title, body, sideA, sideB, poll_data: poll_data || null, created_at: new Date().toISOString(), votes: 0, dn: 0 };
-                io.emit('newPost', newPost);
+    const { data: user, error: userError } = await db.from('users').select('avatar_color').eq('id', userId).single();
+    if (userError || !user) {
+        return res.status(401).json({ error: 'User profile not found. Please log in again.' });
+    }
 
-                db.run("UPDATE users SET peks = peks + 5 WHERE id = ?", [userId]);
-                db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [userId, 5, 'Created a post ✍️']);
-                res.json({ success: true });
-            }
-        );
-    });
+    const avatarColor = user.avatar_color || '#E8531F';
+    const { error: insertError } = await db.from('posts').insert([
+        { id, user_id: userId, username, avatar_color: avatarColor, type, circle_id, title, body: body || '', sideA: sideA || null, sideB: sideB || null, poll_data: poll_data || null }
+    ]);
+
+    if (insertError) {
+        console.error("Insert Error:", insertError.message);
+        return res.status(500).json({ error: 'Failed to publish post: ' + insertError.message });
+    }
+    
+    // Broadcast new post
+    const newPost = { id, user_id: userId, username, avatar_color: avatarColor, type, circle_id, title, body, sideA, sideB, poll_data: poll_data || null, created_at: new Date().toISOString(), votes: 0, dn: 0 };
+    io.emit('newPost', newPost);
+
+    await db.rpc('increment_peks', { user_id_param: userId, amount: 5 });
+    await db.from('peks_history').insert([{ user_id: userId, amt: 5, reason: 'Created a post ✍️' }]);
+    res.json({ success: true });
 });
 
 // Posts: Vote
-app.post('/api/posts/:id/vote', authenticate, (req, res) => {
+app.post('/api/posts/:id/vote', authenticate, async (req, res) => {
     const postId = req.params.id;
     const { type } = req.body; // 'up' or 'down'
     const userId = req.userId;
 
-    db.get("SELECT type FROM post_votes WHERE user_id = ? AND post_id = ?", [userId, postId], (err, row) => {
-        const existingType = row ? row.type : null;
-        
-        const updateCounts = () => {
-            db.get("SELECT votes, dn, user_id FROM posts WHERE id = ?", [postId], (err, post) => {
-                if (post) {
-                    // Reward the poster for an upvote
-                    if (type === 'up' && existingType !== 'up') {
-                        db.run("UPDATE users SET peks = peks + 3 WHERE id = ?", [post.user_id]);
-                        db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [post.user_id, 3, `Someone upvoted your post! ▲`]);
-                    }
-                    // Broadcast live update
-                    io.emit('voteUpdate', { postId, votes: post.votes, dn: post.dn });
-                    res.json({ success: true, votes: post.votes, dn: post.dn, userVote: existingType === type ? null : type });
-                } else {
-                    res.status(404).json({ error: 'Post not found' });
-                }
-            });
-        };
+    const { data: existingVote } = await db.from('post_votes').select('type').eq('user_id', userId).eq('post_id', postId).maybeSingle();
+    const existingType = existingVote ? existingVote.type : null;
 
-        if (existingType) {
-            if (existingType === type) {
-                // Remove vote
-                db.run("DELETE FROM post_votes WHERE user_id = ? AND post_id = ?", [userId, postId], () => {
-                    db.run(`UPDATE posts SET ${type === 'up' ? 'votes = votes - 1' : 'dn = dn - 1'} WHERE id = ?`, [postId], updateCounts);
-                });
-            } else {
-                // Switch vote
-                db.run("UPDATE post_votes SET type = ? WHERE user_id = ? AND post_id = ?", [type, userId, postId], () => {
-                    db.run(`UPDATE posts SET ${type === 'up' ? 'votes = votes + 1, dn = dn - 1' : 'dn = dn + 1, votes = votes - 1'} WHERE id = ?`, [postId], updateCounts);
-                });
+    const updateCounts = async () => {
+        const { data: post } = await db.from('posts').select('votes, dn, user_id').eq('id', postId).single();
+        if (post) {
+            if (type === 'up' && existingType !== 'up') {
+                await db.rpc('increment_peks', { user_id_param: post.user_id, amount: 3 });
+                await db.from('peks_history').insert([{ user_id: post.user_id, amt: 3, reason: `Someone upvoted your post! ▲` }]);
             }
+            io.emit('voteUpdate', { postId, votes: post.votes, dn: post.dn });
+            res.json({ success: true, votes: post.votes, dn: post.dn, userVote: existingType === type ? null : type });
         } else {
-            // New vote
-            db.run("INSERT INTO post_votes (user_id, post_id, type) VALUES (?, ?, ?)", [userId, postId, type], () => {
-                db.run(`UPDATE posts SET ${type === 'up' ? 'votes = votes + 1' : 'dn = dn + 1'} WHERE id = ?`, [postId], updateCounts);
-            });
+            res.status(404).json({ error: 'Post not found' });
         }
-    });
+    };
+
+    if (existingType) {
+        if (existingType === type) {
+            await db.from('post_votes').delete().eq('user_id', userId).eq('post_id', postId);
+            if (type === 'up') await db.rpc('decrement_votes', { post_id_param: postId });
+            else await db.rpc('decrement_dn', { post_id_param: postId });
+            await updateCounts();
+        } else {
+            await db.from('post_votes').update({ type }).eq('user_id', userId).eq('post_id', postId);
+            if (type === 'up') {
+                await db.rpc('increment_votes', { post_id_param: postId });
+                await db.rpc('decrement_dn', { post_id_param: postId });
+            } else {
+                await db.rpc('increment_dn', { post_id_param: postId });
+                await db.rpc('decrement_votes', { post_id_param: postId });
+            }
+            await updateCounts();
+        }
+    } else {
+        await db.from('post_votes').insert([{ user_id: userId, post_id: postId, type }]);
+        if (type === 'up') await db.rpc('increment_votes', { post_id_param: postId });
+        else await db.rpc('increment_dn', { post_id_param: postId });
+        await updateCounts();
+    }
 });
 
 // Posts: Comment
-app.post('/api/posts/:id/comment', authenticate, (req, res) => {
+app.post('/api/posts/:id/comment', authenticate, async (req, res) => {
     const postId = req.params.id;
     const { text } = req.body;
     const userId = req.userId;
     const username = req.username;
 
-    db.get("SELECT avatar_color FROM users WHERE id = ?", [userId], (err, user) => {
-        if (err || !user) {
-            return res.status(401).json({ error: 'User profile not found. Please log in again.' });
-        }
-        db.run("INSERT INTO comments (post_id, user_id, username, text, avatar_color) VALUES (?, ?, ?, ?, ?)",
-            [postId, userId, username, text, user.avatar_color],
-            function(err) {
-                if (err) return res.status(500).json({ error: 'Failed to post comment' });
-                
-                const newComment = { id: this.lastID, post_id: postId, username, avatar_color: user.avatar_color, text, created_at: new Date().toISOString() };
-                io.emit('newComment', newComment);
+    const { data: user } = await db.from('users').select('avatar_color').eq('id', userId).single();
+    if (!user) return res.status(401).json({ error: 'User profile not found' });
 
-                db.run("UPDATE users SET peks = peks + 2 WHERE id = ?", [userId]);
-                db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [userId, 2, 'Commented on a post 💬']);
-                res.json({ id: this.lastID, username, avatar_color: user.avatar_color, text, created_at: new Date().toISOString() });
-            }
-        );
-    });
+    const { data: comment, error } = await db.from('comments').insert([
+        { post_id: postId, user_id: userId, username, text, avatar_color: user.avatar_color }
+    ]).select().single();
+
+    if (error) return res.status(500).json({ error: 'Failed to post comment' });
+    
+    io.emit('newComment', comment);
+
+    await db.rpc('increment_peks', { user_id_param: userId, amount: 2 });
+    await db.from('peks_history').insert([{ user_id: userId, amt: 2, reason: 'Commented on a post 💬' }]);
+    res.json(comment);
 });
 
-app.get('/api/posts/:id/comments', (req, res) => {
-    db.all("SELECT * FROM comments WHERE post_id = ? ORDER BY created_at DESC", [req.params.id], (err, rows) => {
-        if (err) return res.status(500).json({ error: 'Failed to fetch comments' });
-        res.json(rows);
-    });
+app.get('/api/posts/:id/comments', async (req, res) => {
+    const { data: comments, error } = await db.from('comments').select('*').eq('post_id', req.params.id).order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: 'Failed to fetch comments' });
+    res.json(comments);
 });
 
-app.post('/api/posts/:id/poll-vote', authenticate, (req, res) => {
+app.post('/api/posts/:id/poll-vote', authenticate, async (req, res) => {
     const postId = req.params.id;
     const { optionIndex } = req.body;
     const userId = req.userId;
 
-    db.get("SELECT * FROM posts WHERE id = ?", [postId], (err, post) => {
-        if (!post || post.type !== 'poll') return res.status(404).json({ error: 'Poll not found' });
-        
-        const pollData = JSON.parse(post.poll_data || '{"options":[]}');
-        
-        db.get("SELECT option_index FROM poll_votes WHERE user_id = ? AND post_id = ?", [userId, postId], (err, row) => {
-            if (row) return res.status(400).json({ error: 'You have already voted in this poll' });
+    const { data: post } = await db.from('posts').select('*').eq('id', postId).single();
+    if (!post || post.type !== 'poll') return res.status(404).json({ error: 'Poll not found' });
+    
+    const pollData = (typeof post.poll_data === 'string' ? JSON.parse(post.poll_data) : post.poll_data) || { options: [] };
+    
+    const { data: existingVote } = await db.from('poll_votes').select('option_index').eq('user_id', userId).eq('post_id', postId).maybeSingle();
+    if (existingVote) return res.status(400).json({ error: 'You have already voted in this poll' });
 
-            db.run("INSERT INTO poll_votes (user_id, post_id, option_index) VALUES (?, ?, ?)", [userId, postId, optionIndex], function(err) {
-                if (err) return res.status(500).json({ error: 'Failed to cast vote' });
-                
-                // Update post data
-                if (pollData.options[optionIndex]) {
-                    pollData.options[optionIndex].votes = (pollData.options[optionIndex].votes || 0) + 1;
-                    pollData.totalVotes = (pollData.totalVotes || 0) + 1;
-                }
+    const { error: voteError } = await db.from('poll_votes').insert([{ user_id: userId, post_id: postId, option_index: optionIndex }]);
+    if (voteError) return res.status(500).json({ error: 'Failed to cast vote' });
+    
+    // Update poll data in DB
+    if (pollData.options[optionIndex]) {
+        pollData.options[optionIndex].votes = (pollData.options[optionIndex].votes || 0) + 1;
+        pollData.totalVotes = (pollData.totalVotes || 0) + 1;
+    }
 
-                db.run("UPDATE posts SET poll_data = ? WHERE id = ?", [JSON.stringify(pollData), postId], () => {
-                    db.run("UPDATE users SET peks = peks + 8 WHERE id = ?", [userId]);
-                    db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [userId, 8, 'Voted in a poll 📊']);
-                    io.emit('pollUpdate', { postId, pollData });
-                    res.json({ success: true, pollData });
-                });
-            });
-        });
-    });
+    await db.from('posts').update({ poll_data: pollData }).eq('id', postId);
+    await db.rpc('increment_peks', { user_id_param: userId, amount: 8 });
+    await db.from('peks_history').insert([{ user_id: userId, amt: 8, reason: 'Voted in a poll 📊' }]);
+    
+    io.emit('pollUpdate', { postId, pollData });
+    res.json({ success: true, pollData });
 });
 
 // Circles
-app.get('/api/circles', (req, res) => {
-    db.all("SELECT * FROM circles", (err, rows) => {
-        if (err) return res.status(500).json({ error: 'Failed to fetch circles' });
-        res.json(rows);
-    });
+app.get('/api/circles', async (req, res) => {
+    const { data: circles, error } = await db.from('circles').select('*');
+    if (error) return res.status(500).json({ error: 'Failed to fetch circles' });
+    res.json(circles);
 });
 
-app.post('/api/circles/join', authenticate, (req, res) => {
+app.post('/api/circles/join', authenticate, async (req, res) => {
     const { circle_id } = req.body;
     const userId = req.userId;
 
-    db.run("INSERT OR IGNORE INTO user_circles (user_id, circle_id) VALUES (?, ?)", [userId, circle_id], function(err) {
-        if (err) return res.status(500).json({ error: 'Failed to join circle' });
-        if (this.changes > 0) {
-            db.run("UPDATE users SET peks = peks + 5 WHERE id = ?", [userId]);
-            db.run("INSERT INTO peks_history (user_id, amt, reason) VALUES (?, ?, ?)", [userId, 5, 'Joined a circle 🏘️']);
-            db.run("UPDATE circles SET members_count = members_count + 1 WHERE id = ?", [circle_id]);
-        }
-        res.json({ success: true });
-    });
+    const { error, count } = await db.from('user_circles').insert([{ user_id: userId, circle_id }], { count: 'exact', ignoreDuplicates: true });
+    
+    // insert in Supabase with ignoreDuplicates doesn't return count of 'new' items easily in one go
+    // we'll check if it was new by doing a count or just assuming success if no error
+    if (!error) {
+        await db.rpc('increment_peks', { user_id_param: userId, amount: 5 });
+        await db.from('peks_history').insert([{ user_id: userId, amt: 5, reason: 'Joined a circle 🏘️' }]);
+        await db.rpc('increment_circle_members', { circle_id_param: circle_id });
+    }
+    res.json({ success: true });
 });
 
 // User Profile & Stats
-app.get('/api/user/profile', authenticate, (req, res) => {
+app.get('/api/user/profile', authenticate, async (req, res) => {
     const userId = req.userId;
-    db.get("SELECT id, username, email, peks, avatar_color, streak, last_login, created_at FROM users WHERE id = ?", [userId], (err, user) => {
-        if (err) return res.status(500).json({ error: 'Failed to fetch profile' });
-        db.all("SELECT circle_id FROM user_circles WHERE user_id = ?", [userId], (err, circles) => {
-            db.all("SELECT * FROM peks_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 50", [userId], (err, history) => {
-                db.all("SELECT badge_id FROM user_badges WHERE user_id = ?", [userId], (err, badges) => {
-                    res.json({ 
-                        user: { ...user, joinedCircles: circles.map(c => c.circle_id) },
-                        history,
-                        badges: badges.map(b => b.badge_id)
-                    });
-                });
-            });
-        });
+    const { data: user, error: userError } = await db.from('users').select('id, username, email, peks, avatar_color, streak, last_login, created_at').eq('id', userId).single();
+    if (userError) return res.status(500).json({ error: 'Failed to fetch profile' });
+
+    const { data: circles } = await db.from('user_circles').select('circle_id').eq('user_id', userId);
+    const { data: history } = await db.from('peks_history').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(50);
+    const { data: badges } = await db.from('user_badges').select('badge_id').eq('user_id', userId);
+
+    res.json({ 
+        user: { ...user, joinedCircles: circles ? circles.map(c => c.circle_id) : [] },
+        history: history || [],
+        badges: badges ? badges.map(b => b.badge_id) : []
     });
 });
 
 // Leaderboard
-app.get('/api/leaderboard', (req, res) => {
-    db.all("SELECT username as name, peks, avatar_color as av FROM users ORDER BY peks DESC LIMIT 12", (err, rows) => {
-        if (err) return res.status(500).json({ error: 'Failed to fetch leaderboard' });
-        res.json(rows);
-    });
+app.get('/api/leaderboard', async (req, res) => {
+    const { data: rows, error } = await db.from('users').select('username, peks, avatar_color').order('peks', { ascending: false }).limit(12);
+    if (error) return res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    res.json(rows.map(r => ({ name: r.username, peks: r.peks, av: r.avatar_color })));
 });
 
 // Fallback to SPA
