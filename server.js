@@ -22,6 +22,10 @@ const io = require('socket.io')(http, {
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Track active socket connections by userId
+const userSockets = new Map();
+
+
 if (!JWT_SECRET) {
     console.error("FATAL ERROR: JWT_SECRET is not defined in .env");
     process.exit(1);
@@ -62,7 +66,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (!username || username.length < 2) return res.status(400).json({ error: 'Valid username required' });
 
     const { data: user, error } = await db.from('users').select('*').eq('username', username).maybeSingle();
-    if (error) return res.status(500).json({ error: 'Database error' });
+    if (error) {
+        console.error("Supabase Login Error (Fetch):", error.message);
+        return res.status(500).json({ error: 'Database error' });
+    }
 
     if (user) {
         const today = new Date().toISOString().split('T')[0];
@@ -87,7 +94,10 @@ app.post('/api/auth/login', async (req, res) => {
             { username, email: email || '', peks: 100, avatar_color: avatarColor, streak: 1, last_login: today }
         ]).select().single();
 
-        if (insertError) return res.status(500).json({ error: 'Failed to create user' });
+        if (insertError) {
+            console.error("Supabase Login Error (Insert):", insertError.message);
+            return res.status(500).json({ error: 'Failed to create user' });
+        }
         
         await db.from('user_badges').insert([{ user_id: newUser.id, badge_id: 'founder' }]);
         await db.from('peks_history').insert([{ user_id: newUser.id, amt: 100, reason: 'Welcome bonus — Founder! 🌟' }]);
@@ -96,6 +106,20 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({ token, user: { ...newUser } });
     }
 });
+
+async function awardPeks(userId, amount, reason) {
+    await db.rpc('increment_peks', { user_id_param: userId, amount });
+    await db.from('peks_history').insert([{ user_id: userId, amt: amount, reason }]);
+    
+    // Push live update to user
+    const socketId = userSockets.get(userId);
+    if (socketId) {
+        const { data: user } = await db.from('users').select('peks').eq('id', userId).single();
+        if (user) {
+            io.to(socketId).emit('balanceUpdate', { peks: user.peks, reason, amt: amount });
+        }
+    }
+}
 
 // Posts: Get all with sort and type filtering
 app.get('/api/posts', async (req, res) => {
@@ -196,16 +220,26 @@ app.post('/api/posts/:id/vote', authenticate, async (req, res) => {
     const { type } = req.body; // 'up' or 'down'
     const userId = req.userId;
 
-    const { data: existingVote } = await db.from('post_votes').select('type').eq('user_id', userId).eq('post_id', postId).maybeSingle();
+    const { data: existingVote } = await db.from('post_votes').select('type, points_awarded').eq('user_id', userId).eq('post_id', postId).maybeSingle();
     const existingType = existingVote ? existingVote.type : null;
+    const alreadyAwarded = existingVote ? existingVote.points_awarded : false;
 
     const updateCounts = async () => {
-        const { data: post } = await db.from('posts').select('votes, dn, user_id').eq('id', postId).single();
+        const { data: post } = await db.from('posts').select('votes, dn, user_id, type').eq('id', postId).single();
         if (post) {
-            if (type === 'up' && existingType !== 'up') {
-                await db.rpc('increment_peks', { user_id_param: post.user_id, amount: 3 });
-                await db.from('peks_history').insert([{ user_id: post.user_id, amt: 3, reason: `Someone upvoted your post! ▲` }]);
+            // 1. Reward the POSTER for an upvote (once per unique voter)
+            if (type === 'up' && !alreadyAwarded) {
+                await awardPeks(post.user_id, 3, `Someone upvoted your post! ▲`);
+                await db.from('post_votes').update({ points_awarded: true }).eq('user_id', userId).eq('post_id', postId);
             }
+
+            // 2. Reward the VOTER for participation (Hot Takes / Townhall)
+            // We use a different check or reuse points_awarded to track if the VOTER got their participation points
+            if ((post.type === 'hot' || post.type === 'townhall') && !alreadyAwarded) {
+                await awardPeks(userId, 5, `Participated in ${post.type === 'hot' ? 'Hot Take' : 'Townhall'}! 🏅`);
+                await db.from('post_votes').update({ points_awarded: true }).eq('user_id', userId).eq('post_id', postId);
+            }
+
             io.emit('voteUpdate', { postId, votes: post.votes, dn: post.dn });
             res.json({ success: true, votes: post.votes, dn: post.dn, userVote: existingType === type ? null : type });
         } else {
@@ -215,11 +249,12 @@ app.post('/api/posts/:id/vote', authenticate, async (req, res) => {
 
     if (existingType) {
         if (existingType === type) {
+            // Remove vote
             await db.from('post_votes').delete().eq('user_id', userId).eq('post_id', postId);
             if (type === 'up') await db.rpc('decrement_votes', { post_id_param: postId });
             else await db.rpc('decrement_dn', { post_id_param: postId });
-            await updateCounts();
         } else {
+            // Switch vote
             await db.from('post_votes').update({ type }).eq('user_id', userId).eq('post_id', postId);
             if (type === 'up') {
                 await db.rpc('increment_votes', { post_id_param: postId });
@@ -228,14 +263,16 @@ app.post('/api/posts/:id/vote', authenticate, async (req, res) => {
                 await db.rpc('increment_dn', { post_id_param: postId });
                 await db.rpc('decrement_votes', { post_id_param: postId });
             }
-            await updateCounts();
         }
     } else {
-        await db.from('post_votes').insert([{ user_id: userId, post_id: postId, type }]);
+        // New vote
+        await db.from('post_votes').insert([{ user_id: userId, post_id: postId, type, points_awarded: false }]);
         if (type === 'up') await db.rpc('increment_votes', { post_id_param: postId });
         else await db.rpc('increment_dn', { post_id_param: postId });
-        await updateCounts();
     }
+
+    // Always wait for the final count before emitting to ensure 100% accuracy
+    await updateCounts();
 });
 
 // Posts: Comment
@@ -256,8 +293,7 @@ app.post('/api/posts/:id/comment', authenticate, async (req, res) => {
     
     io.emit('newComment', comment);
 
-    await db.rpc('increment_peks', { user_id_param: userId, amount: 2 });
-    await db.from('peks_history').insert([{ user_id: userId, amt: 2, reason: 'Commented on a post 💬' }]);
+    await awardPeks(userId, 2, 'Commented on a post 💬');
     res.json(comment);
 });
 
@@ -351,6 +387,22 @@ app.get('*', (req, res) => {
 
 io.on('connection', (socket) => {
     console.log('A user connected');
+    
+    // Register user socket
+    socket.on('register', (userId) => {
+        userSockets.set(userId, socket.id);
+        console.log(`Socket registered for user: ${userId}`);
+    });
+
+    socket.on('disconnect', () => {
+        // Find and remove the mapping
+        for (let [uid, sid] of userSockets.entries()) {
+            if (sid === socket.id) {
+                userSockets.delete(uid);
+                break;
+            }
+        }
+    });
 });
 
 http.listen(PORT, () => {

@@ -182,6 +182,9 @@ async function initApp(){
       setTimeout(()=>toast('Daily login bonus 🌅', '+50 PëKs awarded', '🏅'), 1200);
   }
   toast('Welcome back, ' + S.user.username + '!', 'You have '+fmt(S.user.peks)+' PëKs.', '🏡');
+  
+  // Register with socket for live updates
+  if (window.socket) window.socket.emit('register', S.user.id);
 }
 
 function updateSB(){
@@ -334,10 +337,8 @@ async function voteHotTake(id, dir, evt){
         body: JSON.stringify({ type: dir })
     });
     if (res && res.success) {
-        toast(dir === 'up' ? 'Agreed! 🔥' : 'Disagreed! ❄️', '+5 PëKs awarded', '🏅');
-        spawnXP(evt.clientX, evt.clientY, 5);
-        S.user.peks += 5;
-        updateSB();
+        evt.currentTarget.parentElement.querySelectorAll('.tkoption').forEach(b => b.classList.remove('myvote'));
+        evt.currentTarget.classList.add('myvote');
     }
 }
 
@@ -356,8 +357,8 @@ async function renderTownhall(){
     const thl = document.getElementById('th-list');
     ths.forEach(t => {
         const total = (t.votes || 0) + (t.dn || 0);
-        const pctA = total === 0 ? 50 : Math.round((t.votes || 0) / total * 100);
-        const pctB = total === 0 ? 50 : 100 - pctA;
+        const pctA = total === 0 ? 0 : Math.round((t.votes || 0) / total * 100);
+        const pctB = total === 0 ? 0 : 100 - pctA;
 
         const div = document.createElement('div');
         div.className = 'thcard';
@@ -381,8 +382,8 @@ async function renderTownhall(){
                 </div>
             </div>
             <div class="thvbtns">
-                <button class="thvbtn thva" onclick="voteTownhall('${t.id}', 'up', event)">Support ${t.sideA || 'Side A'}</button>
-                <button class="thvbtn thvb" onclick="voteTownhall('${t.id}', 'down', event)">Support ${t.sideB || 'Side B'}</button>
+                <button class="thvbtn thva ${t.userVote === 'up' ? 'voted' : ''}" onclick="voteTownhall('${t.id}', 'up', event)">Support ${t.sideA || 'Side A'}</button>
+                <button class="thvbtn thvb ${t.userVote === 'down' ? 'voted' : ''}" onclick="voteTownhall('${t.id}', 'down', event)">Support ${t.sideB || 'Side B'}</button>
             </div>
         `;
         thl.appendChild(div);
@@ -395,25 +396,14 @@ async function voteTownhall(id, dir, evt){
         body: JSON.stringify({ type: dir })
     });
     if (res && res.success) {
-        toast(dir === 'up' ? 'Side A! ⚔️' : 'Side B! ⚔️', '+5 PëKs awarded', '🏅');
-        spawnXP(evt.clientX, evt.clientY, 5);
-        S.user.peks += 5;
-        updateSB();
+        evt.target.parentElement.querySelectorAll('.thvbtn').forEach(b => b.classList.remove('voted'));
+        // If we toggled the same side off, res.userVote might be null (assuming backend returns it)
+        // But for now, let's just highlight what was clicked
+        evt.target.classList.add('voted');
     }
 }
 
-async function voteHotTake(id, dir, evt){
-    const res = await API.fetch(`/api/posts/${id}/vote`, {
-        method: 'POST',
-        body: JSON.stringify({ type: dir })
-    });
-    if (res && res.success) {
-        toast(dir === 'up' ? 'Agreed! 🔥' : 'Disagreed! ❄️', '+5 PëKs awarded', '🏅');
-        spawnXP(evt.clientX, evt.clientY, 5);
-        S.user.peks += 5;
-        updateSB();
-    }
-}
+
 
 async function renderHome(){
   const c=document.getElementById('content');
@@ -444,13 +434,6 @@ async function vpost(pid,dir,evt){
       
       const p = S.posts.find(x => x.id === pid);
       if (p) { p.votes = res.votes; p.dn = res.dn; }
-
-      if (dir === 'up') {
-          spawnXP(evt.clientX, evt.clientY, 1);
-          toast('+1 PëK', 'You upvoted a post ▲', '🏅');
-          S.user.peks += 1;
-          updateSB();
-      }
   }
 }
 
@@ -473,9 +456,6 @@ async function addCmt(pid){
       list.prepend(div);
       const cn = document.getElementById('cn-' + pid);
       if (cn) cn.textContent = parseInt(cn.textContent) + 1;
-      toast('+2 PëKs', 'Commented on a post 💬', '🏅');
-      S.user.peks += 2;
-      updateSB();
   }
 }
 
@@ -682,6 +662,17 @@ function startSim(){
 (async function(){
   // Socket.io for live updates
   const socket = io();
+  window.socket = socket; // Make it globally accessible for registration
+  
+  socket.on('balanceUpdate', (data) => {
+      console.log("Balance update received:", data);
+      S.user.peks = data.peks;
+      updateSB();
+      toast('PëKs Updated! 🏅', data.reason, '✨');
+      // Spawn XP in a random top-right area for balance updates
+      spawnXP(window.innerWidth - 100, 100, data.amt);
+  });
+
   socket.on('voteUpdate', (data) => {
       const ue = document.getElementById('ups-' + data.postId);
       const de = document.getElementById('dns-' + data.postId);
@@ -704,8 +695,8 @@ function startSim(){
       const tpb = document.getElementById('th-pct-b-' + data.postId);
       if (tfa && tfb) {
           const total = (data.votes || 0) + (data.dn || 0);
-          const pctA = total === 0 ? 50 : Math.round((data.votes || 0) / total * 100);
-          const pctB = total === 0 ? 50 : 100 - pctA;
+          const pctA = total === 0 ? 0 : Math.round((data.votes || 0) / total * 100);
+          const pctB = total === 0 ? 0 : 100 - pctA;
           tfa.style.width = pctA + '%';
           tfb.style.width = pctB + '%';
           tpa.textContent = pctA + '%';
